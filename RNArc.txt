@@ -1,0 +1,13 @@
+#### RNA_Ref 需使用的软件列表
+
+### software
+cutadapt = /lustre/work/yongdeng/.local/bin/cutadapt
+IlluQC = /lustre/work/yongdeng/software/protokaryon/soft/QC/IlluQC_PRLL_CapitalBio_Adapter.pl
+trimmomatic = /lustre/work/yongdeng/software/protokaryon/soft/QC/Trimmomatic/trimmomatic-0.36.jar
+
+
+
+### scripts
+
+
+

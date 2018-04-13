@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+#coding:utf-8
+import os,argparse,re,sys,datetime
+#from pathlib2 import Path
+from os.path import join,abspath
+from glob import glob1
+from itertools import count
+from collections import OrderedDict
+from shutil import rmtree
+from socket import gethostname
+
+def mkdir(dir,samples=None):
+    if samples:
+        for n in samples:
+            d = os.path.join(dir,n)
+            if not os.path.isdir(d):
+                os.makedirs(d)
+            else:
+                continue
+    else:
+        if not os.path.isdir(dir):
+            os.makedirs(dir)
+    
+     
+def parseArg():
+    parser = argparse.ArgumentParser(description="This Script is used to do mRNA-Ref analysis workflow for eukaryon organism")
+    parser.add_argument("-raw","--rawdata",type=str,help="The input rawdata dir",required=True,nargs="+")
+    parser.add_argument("-len","--length",type=int,help="The avg length of input rawdata seq file, default: 150",default=150)
+    parser.add_argument("-G","--g_base",type=float,help="The total base(G) count you need, default: 6",default=6.0)
+    parser.add_argument("-p","--parallel",type=int,help="the cpu number used, default:8",required = False, default = 8)
+    parser.add_argument("-sg","--sample_group",type=str,help="The all samples and groups rep. like groupA=sample1,sample2,... groupB=sample3,sample4,...",required = True,nargs="+")
+    parser.add_argument("-a","--addition",type=str,help="the supplyment sample name file, first colnum is the sample name that will mathch the rawdata filename, second colnum is the final sample name which will be uesd for downstream analysis")
+    parser.add_argument("-vs","--vs",type=str,help="the diff groups, like CasegroupA-VS-ControlgroupB ..., ", required = True,nargs="+")
+    parser.add_argument("-g","--genome_dir",type=str,help="the genome reference dir, '*.fa' and '*.gtf' and '*.anno' file must under this dir, and align index will be generate in this dir",required=True)
+    parser.add_argument("-o","--outputdir",type=str,help="The project out dir, analysis directory will be created under this dir, all output will be created under this dir",required = True)
+    parser.add_argument("-na","--noassemble",action = "store_false",default=True,help="whether assemble or not, for expression profile workflow, '--noassemble' must be set")
+    parser.add_argument("-m","--modules",type=str,help='analysis modules, can be chosen from ["raw","clean","align","sum","expression","novel","diff","cor","cluster","enrichment","coexpression","propro","snp","asp"]',choices = ["raw","clean","align","sum","expression","novel","diff","cor","cluster","enrichment","coexpression","propro","snp","asp"],required=True,nargs="+",metavar="modules")
+    parser.add_argument("-dt","--database_type",type=str,default="/K/G",help="enrichment database_type, default: /K/G")
+    parser.add_argument("-it","--idtype",type=str,default="id:ncbigene",choices =["id:ncbigi", "id:uniprot", "id:ensembl","id:ncbigene"],help='gene type of back list and deg list, can be chosen from ["id:ncbigi", "id:uniprot", "id:ensembl","id:ncbigene"],default: id:ncbigene',metavar = "idtype")
+    parser.add_argument("-abbr","--abbr",type=str,help="species abbr",required = True)
+    parser.add_argument("-prodb","--prodb",type=str,help="pro-pro datebase file")
+    parser.add_argument("-ss","--snpspecies",type=str,help="snp species name, only for snp snslysis")
+    parser.add_argument("-mf","--makeflow",type=str,help="the out makeflow file name",required = True)
+    parser.add_argument("-res","--result",action="store_true",default=False,help="whether get the 'results.sh' file for all results, default: not")
+    return parser.parse_args()
+    
+def chech_arg():
+    args = parseArg()
+    modules = args.modules
+    flag = True
+    if "raw" in modules:
+        if not args.rawdata: 
+            print "Error: -raw or raw modules conflict "
+            flag = False
+    if "diff" in modules:
+        if not args.sample_group or not args.vs: 
+            print "Error: -sg or -vs or diff modules conflict"
+            flag = False
+    if "novel" in modules:
+        if args.noassemble == False:
+            print "Error: -na or novel modules conflict"
+            flag = False
+    if "snp" in modules:
+        if not args.snpspecies:
+            print "Error: -ss or snp modules conflict"
+            flag = True
+    if "propro" in modules:
+        if not args.prodb:
+            print "Error: --prodb must be set for propro analysis"
+            flag = False
+ 
+    if flag:
+        return
+    else:
+        sys.exit(1)
+
+def check_makeflow(makeflow):
+    out = os.popen("python /lustre/work/yongdeng/software/python_scripts/checkmakeflow.py %s"%makeflow).read().strip()
+    if out != "All need files exists, OK!":
+        print out
+        sys.exit(1)
+
+def main():
+    chech_arg()
+    a = datetime.datetime.today()
+    shell = []
+    mf = []
+    now = a.isoformat() + "-"
+    args = parseArg()
+    if os.path.exists(args.makeflow):
+        print "%s file exists, please use a new name"%args.makeflow
+        sys.exit(1)
+    out = abspath(args.outputdir)
+    mkdir(out,["analysis","flow"])
+    mkdir(join(out,"flow",now+"flow"))
+    analysis = join(out,"analysis")
+    modules = args.modules
+    moduledict={"raw":"rawdata","clean":"cleandata","align":"align","expression":"stringtie","novel":"novel","diff":"deg","cor":"sample_cor","cluster":"cluster","enrichment":"enrichment","coexpression":"coexpression","propro":"propro","snp":"snp","asp":"asp"}
+    mkdir(analysis,[moduledict[i] for i in modules])
+    gdir = abspath(args.genome_dir)    
+    if not all([len(glob1(gdir,"*.gtf")) >= 1,len(glob1(gdir,"*.anno")) >= 1]):
+        print "Error: no *.gtf or *.anno file in genome dir"
+        sys.exit(1)
+     
+    if not any([len(glob1(gdir,"*.fa")) >= 1,len(glob1(gdir,"*.fasta")) >= 1]):
+        print "Error: no *.fa or *.fasta file in genome dir"
+        sys.exit(1)
+        
+    if len(glob1(gdir,"*.gtf")) > 1 or len(glob1(gdir,"*.anno")) > 1:
+        print "only one *.gtf or *.fa or *.anno file in genome dir allowed, find %s" %" ".join(glob("*.gtf"))
+        sys.exit(1)
+    else:
+        gtf = join(gdir,glob1(gdir,"*.gtf")[0])
+        anno = join(gdir,glob1(gdir,"*.anno")[0])
+        fa = join(gdir,glob1(gdir,"*.fa")[0]) if len(glob1(gdir,"*.fa")) else join(gdir,glob1(gdir,"*.fasta")[0])
+          
+    samples = []
+    for i in args.sample_group:
+        samples.extend(i.split("=")[-1].split(","))
+    samples = sorted(set(samples))
+    if "raw" in modules:
+        cmdraw = "python /lustre/work/yongdeng/software/protokaryon/flow/cat_rawdata.py -i %s -o %s -s %s -G %f -p %d -len %d -mf %s"%(" ".join(args.rawdata),join(analysis,"rawdata")," ".join(samples),args.g_base,args.parallel,args.length,join(out,"flow",now+"flow","Rawdata.mf"))
+        if args.addition:
+            cmdraw += ' -a %s'%args.addition
+        os.system(cmdraw);shell.append(cmdraw);mf.append(join(out,"flow",now+"flow","Rawdata.mf"))
+    if "clean" in modules:
+        cmdclean= "python /lustre/work/yongdeng/software/protokaryon/flow/QC_rawdata.py -i %s -p %d -o %s -mf %s"%(join(analysis,"rawdata"),args.parallel,join(analysis,"cleandata"),join(out,"flow",now+"flow","Qcrawdata.mf"))
+        os.system(cmdclean);shell.append(cmdclean);mf.append(join(out,"flow",now+"flow","Qcrawdata.mf"))
+    if "align" in modules:
+        cmdalign = "python /lustre/work/yongdeng/software/eukaryon/flow/hisat_align_clean.py -i %s -g %s -p %d -o %s -mf %s"%(join(analysis,"cleandata"),gdir,args.parallel,join(analysis,"align"),join(out,"flow",now+"flow","Align.mf"))
+        if args.noassemble:
+            cmdalign += " -a"
+        os.system(cmdalign);shell.append(cmdalign);mf.append(join(out,"flow",now+"flow","Align.mf"))
+    if "expression" in modules:
+        if args.noassemble:
+            cmdstringtie = 'python /lustre/work/yongdeng/software/eukaryon/flow/stringtie_assemble_align.py -i %s -g %s -o %s -p %d -t FPKM -mf %s -anno %s'%(join(analysis,"align"),gtf,join(analysis,"stringtie"),args.parallel,join(out,"flow",now+"flow","Stringtie.mf"),anno)
+            os.system(cmdstringtie);shell.append(cmdstringtie);mf.append(join(out,"flow",now+"flow","Stringtie.mf"))
+        else:
+            cmdstringtie = 'python /lustre/work/yongdeng/software/eukaryon/flow/stringtie_assemble_align.py -i %s -g %s -o %s -p %d -t FPKM -mf %s -anno %s'%(join(analysis,"align"),gtf,join(analysis,"stringtie"),args.parallel,join(out,"flow",now+"flow","Stringtie.mf"),anno)
+            cmdstringtie += " -na"
+            os.system(cmdstringtie);shell.append(cmdstringtie);mf.append(join(out,"flow",now+"flow","Stringtie.mf"))
+    if "sum" in modules:
+        cmdsummary = "python /lustre/work/yongdeng/software/protokaryon/flow/summary_data.py -raw %s -align %s -clean %s -reflat %s -p %d -o %s -mf %s"%(join(analysis,"rawdata"),join(analysis,"align"),join(analysis,"cleandata"),gtf+".refFlat",args.parallel,analysis,join(out,"flow",now+"flow","Summary.mf"))
+        os.system(cmdsummary);shell.append(cmdsummary);mf.append(join(out,"flow",now+"flow","Summary.mf"))
+    if "novel" in modules:
+        samplegtf = [s + "=" + g for s,g in zip(samples,[join(analysis,"stringtie",i,"transcripts.gtf.filter.gtf") for i in samples])] + ["merge=" + join(analysis,"stringtie","merge/merged.gtf")]
+        cmdnovel = 'python  /lustre/work/yongdeng/software/eukaryon/flow/novel_trans.py -i %s -r %s -o %s -mf %s'%(" ".join(samplegtf),gtf,join(analysis,"novel"),join(out,"flow",now+"flow","Novel.mf"))
+        os.system(cmdnovel);shell.append(cmdnovel);mf.append(join(out,"flow",now+"flow","Novel.mf"))
+    if "diff" in modules:
+        cmdiff = 'python /lustre/work/yongdeng/software/protokaryon/flow/diff_mf.py -c %s -sg %s -vs %s -anno %s -o %s -mf %s'%(join(analysis,"stringtie","gene_count_matrix.txt")," ".join(args.sample_group)," ".join(args.vs),join(analysis,"stringtie/track_ref.geneanno.txt"),join(analysis,"deg"),join(out,"flow",now+"flow","Deg.mf"))
+        os.system(cmdiff);shell.append(cmdiff);mf.append(join(out,"flow",now+"flow","Deg.mf"))
+    if "cor" in modules:
+        cmdcor = "python /lustre/work/yongdeng/software/protokaryon/flow/sample_cor.py -fpkm %s -o %s -mf %s"%(join(analysis,"stringtie/gene_FPKM_matrix.txt"),join(analysis,"sample_cor"),join(out,"flow",now+"flow","Sample_cor.mf"))
+        os.system(cmdcor);shell.append(cmdcor);mf.append(join(out,"flow",now+"flow","Sample_cor.mf"))
+    if "cluster" in modules:
+        vsdeg = [i+","+join(analysis,"deg",i,"deg.up_down.txt") for i in args.vs]
+        cmdcluster = "python /lustre/work/yongdeng/software/protokaryon/flow/cluster.py -fpkm %s -sg %s -deg %s -o %s -mf %s"%(join(analysis,"stringtie/gene_FPKM_matrix.txt")," ".join(args.sample_group)," ".join(vsdeg),join(analysis,"cluster"),join(out,"flow",now+"flow","Cluster.mf"))
+        os.system(cmdcluster);shell.append(cmdcluster);mf.append(join(out,"flow",now+"flow","Cluster.mf"))
+    if "coexpression" in modules:
+        cmdcoe = "python /lustre/work/yongdeng/software/protokaryon/flow/coexpression.py -eq %s -deg %s -vs %s -sg %s -o %s -mf %s"%(join(analysis,"stringtie/gene_FPKM_matrix.txt"),join(analysis,"deg")," ".join(args.vs)," ".join(args.sample_group),join(analysis,"coexpression"),join(out,"flow",now+"flow","Coexpression.mf"))
+        os.system(cmdcoe);shell.append(cmdcoe);mf.append(join(out,"flow",now+"flow","Coexpression.mf"))
+    if "propro" in modules:
+        cmdpro = "python /lustre/work/yongdeng/software/protokaryon/flow/propro.py -deg %s -vs %s -o %s -db %s -mf %s"%(join(analysis,"deg")," ".join(args.vs),join(analysis,"propro"),args.prodb,join(out,"flow",now+"flow","Propro.mf"))
+        os.system(cmdpro);shell.append(cmdpro);mf.append(join(out,"flow",now+"flow","Propro.mf"))
+
+    if "snp" in modules:
+        cmdsnp = "perl /lustre/work/yongdeng/software/protokaryon/flow/creat.snpindel.makeflow.pl -samples %s -species %s -aligndir %s -fa %s -snpdir %s -od %s -name %s"%(",".join(samples),args.snpspecies,join(analysis,"align"),fa,join(analysis,"snp"),join(out,"flow",now+"flow"),"Snp.mf")
+        os.system(cmdsnp);shell.append(cmdsnp);mf.append(join(out,"flow",now+"flow","Snp.mf"))
+        
+    if "asp" in modules:
+        fa = glob1(gdir,"*.fa")[0]
+        samplegtf = [s + "=" + g for s,g in zip(samples,[join(analysis,"stringtie",i,"transcripts.gtf.filter.gtf") for i in samples])] + ["merge=" + join(analysis,"stringtie","merge/merged.gtf")]
+        cmdasp = "python /lustre/work/yongdeng/software/protokaryon/flow/asp.py -gtf %s -hdrs %s -o %s -mf %s"%(" ".join(samplegtf),join(gdir,fa+".hdrs"),join(analysis,"asp"),join(out,"flow",now+"flow","Asp.mf"))
+        os.system(cmdasp);shell.append(cmdasp);mf.append(join(out,"flow",now+"flow","Asp.mf"))
+        
+    if "enrichment" in modules:
+        cmdgokegg = "python /lustre/work/yongdeng/software/protokaryon/flow/enrichment.py -dt %s -it %s -deg %s -vs %s -abbr %s -o %s -mf %s"%(args.database_type,args.idtype,join(analysis,"deg")," ".join(args.vs),args.abbr,join(analysis,"enrichment"),join(out,"flow",now+"flow","Enrichment.mf"))
+        os.system(cmdgokegg);shell.append(cmdgokegg);mf.append(join(out,"flow",now+"flow","Enrichment.mf"))
+            
+    os.system('cat %s > %s'%(" ".join(mf),join(out,args.makeflow)))
+    
+    with open(join(out,"flow",now+"flow","all.sh"),"w") as fo:
+        for cmd in shell:
+            fo.write(cmd + "\n\n")
+    
+    check_makeflow(join(out,args.makeflow))
+            
+    if args.result: result()
+            
+def result():
+    args = parseArg()
+    orderedmodules = ["raw","clean","align","sum","expression","novel","diff","cor","cluster","enrichment","coexpression","propro","snp","asp"]
+    modules = args.modules
+    cpdict=OrderedDict()
+    samples = []
+    for i in args.sample_group:
+        samples.extend(i.split("=")[-1].split(","))
+    samples = sorted(set(samples))    
+    result = abspath(join(args.outputdir,"results"))
+    if os.path.isdir(result):rmtree(result)
+    analysis = abspath(join(args.outputdir,"analysis"))
+    mkdir(result)
+#    if os.path.isdir(result):
+#        print "Error: " + result +" exists, please use a new results dir name"
+#        sys.exit()
+    c = 1
+    if not (("raw" in modules) and ("clean" in modules) and ("align" in modules)):
+        print "raw clean align modules not in this project, which might cause error in get result"
+        sys.exit(1)
+    if "raw" in modules and "clean" in modules  and "align" in modules:
+        mkdir(join(result,str(c)+".quality_control","rawdata"),[join(i,j) for i in samples for j in ["R1","R2"]])
+        mkdir(join(result,str(c)+".quality_control","cleandata"),[join(i,j) for i in samples for j in ["R1","R2"]])
+        
+        for s in samples:
+            for r in "12":
+                k1 = join(analysis,"fastqcRaw",s,"R%s_fastqc"%r,"Images","per_base_quality.png")
+                v1 = join(result,str(c)+".quality_control","rawdata",s,"R"+r)
+                k2 = join(analysis,"fastqcRaw",s,"R%s_fastqc"%r,"Images","per_base_sequence_content.png")
+                v2 = join(result,str(c)+".quality_control","rawdata",s,"R"+r)
+                cpdict[k1]=v1
+                cpdict[k2]=v2
+                k1 = join(analysis,"fastqcClean",s,"R%s.clean_fastqc"%r,"Images","per_base_quality.png")
+                v1 = join(result,str(c)+".quality_control","cleandata",s,"R"+r)
+                k2 = join(analysis,"fastqcClean",s,"R%s.clean_fastqc"%r,"Images","per_base_sequence_content.png")
+                v2 = join(result,str(c)+".quality_control","cleandata",s,"R"+r)
+                cpdict[k1]=v1
+                cpdict[k2]=v2   
+                k1 = join(analysis,"fastqcClean",s,"R%s.clean_fastqc.zip"%r)
+                v1 = join(result,str(c)+".quality_control","cleandata",s,"R"+r)
+                cpdict[k1]=v1
+                cpdict[k2]=v2
+                
+        c += 1
+        mkdir(join(result,str(c)+".cleandata"),samples)
+        for s in samples:
+            k = join(analysis,"cleandata",s,"R1_avgQual.png");v = join(result,str(c)+".cleandata",s);cpdict[k]=v
+            k = join(analysis,"cleandata",s,"R2_avgQual.png");v = join(result,str(c)+".cleandata",s);cpdict[k]=v
+            k = join(analysis,"cleandata",s,"summary.png");v = join(result,str(c)+".cleandata",s);cpdict[k]=v
+        k = join(analysis,"cleandata","clean_data.state.txt")
+        v = join(result,str(c)+".cleandata","clean_data.state.xlsx")
+        cpdict[k] = v
+        
+        c+=1
+        mkdir(join(result,str(c)+".alignment_statistics"),samples)
+        for s in samples:
+            k = join(analysis,"picard",s,"*.png")
+            v = join(result,str(c)+".alignment_statistics",s)
+            cpdict[k] = v
+        k = join(analysis,"align","align.state.txt")
+        v = join(result,str(c)+".alignment_statistics","align.state.xlsx")
+        cpdict[k] = v
+        
+    if args.noassemble:
+        c +=1
+        mkdir(join(result,str(c)+".assemble"))
+        k = join(analysis,"stringtie","*boxplot.png")
+        v = join(result,str(c)+".assemble")
+        cpdict[k] = v
+        k = join(analysis,"stringtie","merge","merged.gtf.transcript.length_distribution.png");v=join(result,str(c)+".assemble");cpdict[k]=v
+        k = join(analysis,"stringtie","assembly.state.txt");v=join(result,str(c)+".assemble","assembly.state.xlsx");cpdict[k]=v
+     
+    if "expression" in modules:  ## rawcount.xlsx normalizedcount.xlsx fpkm
+        c += 1
+        mkdir(join(result,str(c)+".expression"),["saturation","density"])
+        k = join(analysis,"stringtie","expression","*fpkm_density.png");v=join(result,str(c)+".expression","density");cpdict[k]=v
+        k = join(analysis,"stringtie","expression","all.fpkm_box.png");v=join(result,str(c)+".expression","density");cpdict[k]=v
+        k = join(analysis,"stringtie","expression","*saturation.png");v=join(result,str(c)+".expression","saturation");cpdict[k]=v                        
+        k = join(analysis,"stringtie","*violin.png");v=join(result,str(c)+".expression");cpdict[k]=v
+        k = join(analysis,"stringtie","gene_FPKM_matrix.anno.txt");v=join(result,str(c)+".expression","genes.fpkm.anno.xlsx");cpdict[k]=v
+        k = join(analysis,"stringtie","gene_count_matrix.txt");v = join(result,str(c)+".expression","genes.rawcount.xlsx");cpdict[k]=v
+        k = join(analysis,"deg","gene_count_matrix.normalized.txt");v = join(result,str(c)+".expression","gene.normalizedcount.xlsx");cpdict[k]=v
+        
+    if "cor" in modules:
+        c+=1
+        mkdir(join(result,str(c)+".sample_correlation"))
+        k = join(analysis,"sample_cor","genes.fpkm.cor.result")
+        v = join(result,str(c)+".sample_correlation","sample.correlation.matrix.xlsx")
+        cpdict[k] = v
+        k = join(analysis,"sample_cor","genes.fpkm.cor.png")
+        v = join(result,str(c)+".sample_correlation","sample.correlation.png")
+        cpdict[k] = v
+    if "diff" in modules:
+        c+=1
+        mkdir(join(result,str(c)+".differentially_expressed_gene"),args.vs+["venn_DEG","venn_DOWN","venn_UP"])
+        k = join(analysis,"deg","deg.num.p*")
+        v = join(result,str(c)+".differentially_expressed_gene")
+        cpdict[k] = v
+        for i in args.vs:
+            k = join(analysis,"deg",i,i+".anno.txt");v = join(result,str(c)+".differentially_expressed_gene",i,"deg.anno.xlsx");cpdict[k]=v
+            k = join(analysis,"deg",i,"deg.up.anno.txt");v = join(result,str(c)+".differentially_expressed_gene",i,"deg.up.anno.xlsx");cpdict[k]=v
+            k = join(analysis,"deg",i,"deg.down.anno.txt");v = join(result,str(c)+".differentially_expressed_gene",i,"deg.down.anno.xlsx");cpdict[k]=v
+            k = join(analysis,"deg",i,i+"*.png");v = join(result,str(c)+".differentially_expressed_gene",i);cpdict[k]=v
+        for i in ["venn_DEG","venn_DOWN","venn_UP"]:
+            k = join(analysis,"deg",i,"list.txt");v= join(result,str(c)+".differentially_expressed_gene",i,"list.xlsx");cpdict[k]=v
+            k = join(analysis,"deg",i,"stat.txt");v= join(result,str(c)+".differentially_expressed_gene",i,"stat.xlsx");cpdict[k]=v
+            if os.path.isfile(join(analysis,"deg",i,"venn.tiff")):
+                k = join(analysis,"deg",i,"venn.tiff")
+                v = join(result,str(c)+".differentially_expressed_gene",i,"venn.tiff")
+                cpdict[k]=v
+                
+    if "enrichment" in modules:
+        c+=1      ## enrichment
+        mkdir(join(result,str(c)+".enrichment"))
+        k = join(analysis,"enrichment","result/*");v = join(result,str(c)+".enrichment");cpdict[k]=v      
+               
+    if "cluster" in modules:  ## 缺少所有样本的一个聚类表,各分组对应的文件参考150631项目
+        c +=1
+        mkdir(join(result,str(c)+".cluster"),args.vs)
+        for i in args.vs:
+            k = join(analysis,"cluster",i,"DEG_cluster.input.ng.CPM.log2.centered.genes_vs_samples_heatmap.pdf");v = join(result,str(c)+".cluster",i,"DEG_cluster.input.pdf");cpdict[k]=v
+            k = join(analysis,"cluster",i,"DEG_cluster.input.ng.CPM.log2.centered.heatmap.result");v = join(result,str(c)+".cluster",i,"DEG_cluster.input.heatmap.xlsx");cpdict[k]=v
+            k = join(analysis,"cluster",i,"DEG_cluster.input.ng.CPM.log2.centered.genes_vs_samples_heatmap.txt");v = join(result,str(c)+".cluster",i,"DEG_cluster.input.tree.xlsx");cpdict[k]=v
+            k = join(analysis,"cluster",i,"DEG_cluster.input.txt");v = join(result,str(c)+".cluster",i,"DEG_cluster.input.xlsx");cpdict[k]=v
+
+        k = join(analysis,"cluster","DEG_cluster.input.ng.CPM.log2.centered.genes_vs_samples_heatmap.pdf");v = join(result,str(c)+".cluster","DEG_cluster.input.pdf");cpdict[k]=v
+        k = join(analysis,"cluster","DEG_cluster.input.ng.CPM.log2.centered.heatmap.result");v = join(result,str(c)+".cluster","DEG_cluster.input.heatmap.xlsx");cpdict[k]=v
+        k = join(analysis,"cluster","DEG_cluster.input.ng.CPM.log2.centered.genes_vs_samples_heatmap.txt");v = join(result,str(c)+".cluster","DEG_cluster.input.tree.xlsx");cpdict[k]=v
+        k = join(analysis,"cluster","DEG_cluster.input.txt");v = join(result,str(c)+".cluster","DEG_cluster.input.xlsx");cpdict[k]=v       
+        
+    if "snp" in modules:
+        c+=1
+        mkdir(join(result,str(c)+".cSNP.InDel"))
+        k = join(analysis,"snp","indel.readcount.txt");v = join(result,str(c)+".cSNP.InDel","indel.readcount.xlsx");cpdict[k]=v
+        k = join(analysis,"snp","indeleff.csv");v = join(result,str(c)+".cSNP.InDel","indeleff.csv");cpdict[k]=v
+        k = join(analysis,"snp","indeleff.filter.txt");v = join(result,str(c)+".cSNP.InDel","indeleff.filter.xlsx");cpdict[k]=v
+        k = join(analysis,"snp","indeleff.high.filter.txt");v = join(result,str(c)+".cSNP.InDel","indeleff.high.filter.xlsx");cpdict[k]=v
+        k = join(analysis,"snp","indelEFF.pdf");v = join(result,str(c)+".cSNP.InDel","indelEFF.pdf");cpdict[k]=v
+        k = join(analysis,"snp","indeleff.state.txt");v = join(result,str(c)+".cSNP.InDel","indeleff.state.txt");cpdict[k]=v
+        k = join(analysis,"snp","snp.readcount.txt");v = join(result,str(c)+".cSNP.InDel","snp.readcount.xlsx");cpdict[k]=v
+        k = join(analysis,"snp","snpeff.csv");v = join(result,str(c)+".cSNP.InDel","snpeff.csv");cpdict[k]=v
+        k = join(analysis,"snp","snpeff.filter.txt");v = join(result,str(c)+".cSNP.InDel","snpeff.filter.txt");cpdict[k]=v
+        k = join(analysis,"snp","snpeff.high.filter.txt");v = join(result,str(c)+".cSNP.InDel","snpeff.high.filter.txt");cpdict[k]=v
+        k = join(analysis,"snp","snpEFF.pdf");v = join(result,str(c)+".cSNP.InDel","snpEFF.pdf");cpdict[k]=v
+        k = join(analysis,"snp","snpeff.state.txt");v = join(result,str(c)+".cSNP.InDel","snpeff.state.xlsx");cpdict[k]=v
+        k = join(analysis,"snp","indeleff.vcf");v = join(result,str(c)+".cSNP.InDel","indeleff.vcf");cpdict[k]=v
+        k = join(analysis,"snp","snpeff.vcf");v = join(result,str(c)+".cSNP.InDel","snpeff.vcf");cpdict[k]=v
+        
+    if "novel" in modules:
+        c+=1
+        mkdir(join(result,str(c)+".novel_isoforms"),samples+["merge"])
+        for i in samples + ["merge"]:
+            k = join(analysis,"novel",i,"novel_transcripts.gtf");v = join(result,str(c)+".novel_isoforms",i,"novel_transcripts.gtf");cpdict[k]=v
+        k = join(analysis,"novel","novel_transcripts.state.txt");v = join(result,str(c)+".novel_isoforms","novel_transcripts.state.xlsx");cpdict[k]=v
+                                      
+    if "asp" in modules:
+        c+=1
+        mkdir(join(result,str(c)+".alternative_splicing"),samples+["merge"])
+        for i in samples + ["merge"]:
+            k = join(analysis,"asp",i,"ASprofile.as.info");v = join(result,str(c)+".alternative_splicing",i,"ASprofile.as.info.xlsx");cpdict[k]=v
+        k = join(analysis,"asp","asprofile.state.txt");v = join(result,str(c)+".alternative_splicing","asprofile.state.xlsx");cpdict[k]=v    
+        
+    if "coexpression" in modules:
+        c+=1
+        mkdir(join(result,str(c)+".coexpression"))
+        coe_vs = [i for i in os.listdir(join(analysis,"coexpression")) if os.path.isdir(i)]
+        k = join(analysis,"coexpression","filter.coexpression.txt");v = join(result,str(c)+".coexpression","filter.coexpression.txt");cpdict[k]=v
+        k = join(analysis,"coexpression","Co-Expression.xls");v = join(result,str(c)+".coexpression","Co-Expression.xlsx");cpdict[k]=v
+        if len(coe_vs) >= 1:
+            mkdir(join(result,"coexpression"),coe_vs)
+            for i in coe_vs:
+                k = join(analysis,"coexpression",i,"filter.coexpression.txt");v = join(result,str(c)+".coexpression",i,"filter.coexpression.txt");cpdict[k]=v
+                k = join(analysis,"coexpression",i,"Co-Expression.xls");v = join(result,str(c)+".coexpression",i,"Co-Expression.xlsx");cpdict[k]=v
+        
+    if "propro" in modules:
+        c+=1
+        pro_vs = [i for i in os.listdir(join(analysis,"propro")) if os.path.isdir(join(analysis,"propro",i))]
+        mkdir(join(result,str(c)+".protein_interaction"),pro_vs)
+        for i in pro_vs:
+            k = join(analysis,"propro",i,"deg.pro-pro.txt");v = join(result,str(c)+".protein_interaction",i,"deg.pro-pro.xlsx");cpdict[k]=v
+            k = join(analysis,"propro",i,"filter.propro.txt");v = join(result,str(c)+".protein_interaction",i,"filter.propro.txt");cpdict[k]=v
+#    if os.path.isfile(join(analysis,"stringtie","track_ref.geneanno.txt")) and os.path.isfile(join(analysis,"stringtie","gene_FPKM_matrix.txt")) and os.path.isfile(join(analysis,"enrichment","back.anno.xls")):
+#        mkdir(join(result,"total.table.for.DEG"))
+#        os.system("python /lustre/work/yongdeng/software/protokaryon/flow/total.anno.py -sg %s -vs %s -anno %s -back %s -degdir %s -fpkm %s -o %s"%(args.sample_group,args.vs,join(analysis,"stringtie","track_ref.geneanno.txt"),join(analysis,"enrichment","back.anno.xls"),join(analysis,"deg"),join(analysis,"stringtie","gene_FPKM_matrix.txt"),join(analysis,"total.table.for.DEG.txt")))
+#        k = join(analysis,"total.table.for.DEG.txt")
+#        v = join(result,"total.table.for.DEG","gene.fpkm.diff.anno.xlsx")
+#        cpdict[k] = v
+
+    with open(join(args.outputdir,"results.sh"),"w") as fi:        
+        for k in cpdict:
+            if cpdict[k].endswith(".xlsx"):
+                fi.write("perl /lustre/work/zhonghuali/software/rna.ref/bin/pm/Excel-Writer-XLSX-0.95/examples/tab2xlsx.pl %s %s\n"%(k,cpdict[k]))
+            else:
+                fi.write("cp -r %s %s\n"%(k,cpdict[k]))
+        if "enrichment" in modules:
+            mkdir(join(result,"total.table.for.DEG"))
+            fi.write(("python /lustre/work/yongdeng/software/protokaryon/flow/total.anno.py -sg %s -vs %s -anno %s -back %s -degdir %s -fpkm %s -o %s && "%(" ".join(args.sample_group)," ".join(args.vs),join(analysis,"stringtie","track_ref.geneanno.txt"),join(analysis,"enrichment","back.anno.xls"),join(analysis,"deg"),join(analysis,"stringtie","gene_FPKM_matrix.txt"),join(analysis,"total.table.for.DEG.txt"))))
+            fi.write('perl /lustre/work/zhonghuali/software/rna.ref/bin/pm/Excel-Writer-XLSX-0.95/examples/tab2xlsx.pl %s %s\n'%(join(analysis,"total.table.for.DEG.txt"),join(result,"total.table.for.DEG","gene.fpkm.diff.anno.xlsx")))
+
+
+if __name__ == "__main__":
+    main()
+    
+
